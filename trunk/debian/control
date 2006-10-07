@@ -1,0 +1,17 @@
+Source: gnscd
+Section: admin
+Priority: optional
+Maintainer: GSD Team <gsd-team@google.com>
+Build-Depends: debhelper (>= 4.0.0)
+Standards-Version: 3.6.1
+
+Package: gnscd
+Architecture: any
+Depends: ${shlibs:Depends}
+Conflicts: nscd232, nscd, nscd-compat
+Provides: nscd232, nscd, nscd-compat
+Description: Google reimplementation of GNU nscd, hopefully with fewer bugs.
+ This is a complete reimplementation of GNU nscd. Hopefully it has fewer bugs
+ than the original, and won't lock up mysteriously for no apparent reason.
+ Additionally, it listens on both /var/run/nscd/socket and the older path
+ /var/run/.nscd_socket, making the nscd-compat wrapper daemon unnecessary.
