@@ -1,0 +1,15 @@
+gnscd (1.0.2) breezy; urgency=low
+
+  * Native package version
+  * get rid of DH_COMPAT to eliminate build warnings
+  * debian/compat set to 4
+  * Section: set to valid admin section
+
+ -- Drake Diedrich <dld@google.com>  Thu, 28 Sep 2006 13:21:39 -0700
+
+gnscd (1.0-1) breezy; urgency=low
+
+  * Initial Release.
+
+ -- Mike Mammarella <mdm@google.com>  Fri, 15 Sep 2006 14:41:19 -0700
+

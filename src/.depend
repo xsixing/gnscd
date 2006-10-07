@@ -1,0 +1,5 @@
+cache.o: cache.c nscd.h misc.h lookup.h cache.h
+lookup.o: lookup.c nscd.h misc.h cache.h lookup.h
+main.o: main.c nscd.h cache.h misc.h
+stats.o: stats.c nscd.h
+thread.o: thread.c nscd.h misc.h cache.h lookup.h
