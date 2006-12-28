@@ -30,16 +30,23 @@
 #include "cache.h"
 #include "lookup.h"
 
+/* These timeouts are used when communicating with clients. They are given in
+ * milliseconds. The long timeout is used between requests to close the
+ * connection when it is idle (or before the first request), and the short
+ * timeout is used during requests to wait for more data. */
+#define SHORT_TIMEOUT 200
+#define LONG_TIMEOUT 5000
+
 /* like read(), but times out if no data can be read */
-static int read_timeout(int fd, void * buf, size_t len, int timeout, int is_nonblock)
+static ssize_t read_timeout(int fd, void * buf, size_t len, int timeout, int is_nonblock)
 {
-	int r;
+	ssize_t r;
 	struct pollfd pfd;
 	
 	if(is_nonblock)
 	{
 		r = read(fd, buf, len);
-		if(r > 0)
+		if(r > 0 || (r < 0 && errno != EAGAIN))
 			return r;
 	}
 	
@@ -58,7 +65,7 @@ static int read_timeout(int fd, void * buf, size_t len, int timeout, int is_nonb
 }
 
 /* like write(), but keep retrying unless we fail for a timeout period */
-static int write_all(int fd, const void * buf, size_t len, int timeout)
+static ssize_t write_all(int fd, const void * buf, size_t len, int timeout)
 {
 	size_t n = len;
 	ssize_t ret;
@@ -107,7 +114,8 @@ static int is_disabled(request_type type)
 		case GETGRENT:
 			return 0;
 		case GETAI:
-			/* NOT IMPLEMENTED */
+			/* Note that getaddrinfo() support is not only disabled, but it is also
+			 * not implemented since Google doesn't use the host cache anyway. */
 			return 1;
 		default:
 			return -1;
@@ -129,6 +137,7 @@ static int process_request(int client, uid_t uid, request_header * req, void * k
 	
 	if(debug)
 		printf("Got request type %d (key = [%s]) from UID %d on FD %d\n", req->type, (char *) key, uid, client);
+	/* first check for control messages */
 	if(req->type > LASTDBREQ && req->type != GETPWENT && req->type != GETGRENT && req->type != GETAI && req->type != INITGROUPS)
 	{
 		if(req->type == SHUTDOWN)
@@ -137,7 +146,8 @@ static int process_request(int client, uid_t uid, request_header * req, void * k
 		{
 			/* to aid the use of -g in figuring out whether
 			 * gnscd is answering queries correctly, grab
-			 * the cache mutex and release it */
+			 * the cache mutex and release it to make sure
+			 * it's not stuck locked by some thread */
 			pthread_mutex_lock(&cache_mutex);
 			pthread_mutex_unlock(&cache_mutex);
 			send_stats(client, uid);
@@ -152,6 +162,7 @@ static int process_request(int client, uid_t uid, request_header * req, void * k
 		return 1;
 	}
 	
+	/* not a control message, so check if the service is disabled */
 	if(is_disabled(req->type))
 	{
 		if(debug)
@@ -159,7 +170,7 @@ static int process_request(int client, uid_t uid, request_header * req, void * k
 		r = generate_disabled_reply(req->type, &reply, &reply_len);
 		if(r < 0)
 			return -1;
-		if(write_all(client, reply, reply_len, 200) != reply_len)
+		if(write_all(client, reply, reply_len, SHORT_TIMEOUT) != reply_len)
 			return -1;
 		return r;
 	}
@@ -190,7 +201,7 @@ static int process_request(int client, uid_t uid, request_header * req, void * k
 		r = entry->close_socket;
 		/* reset the refresh count */
 		entry->refreshes = 0;
-		if(write_all(client, entry->reply, entry->reply_len, 200) != entry->reply_len)
+		if(write_all(client, entry->reply, entry->reply_len, SHORT_TIMEOUT) != entry->reply_len)
 			r = -1;
 		pthread_mutex_unlock(&cache_mutex);
 		if(extra_mutex)
@@ -213,7 +224,7 @@ static int process_request(int client, uid_t uid, request_header * req, void * k
 		int close_socket = r;
 		int add_result = -1;
 		
-		if(write_all(client, reply, reply_len, 200) != reply_len)
+		if(write_all(client, reply, reply_len, SHORT_TIMEOUT) != reply_len)
 		{
 			if(debug)
 				printf("Failed to write to client %d\n", client);
@@ -244,11 +255,11 @@ static int process_request(int client, uid_t uid, request_header * req, void * k
 static int handle_request(int client, uid_t uid)
 {
 	request_header req;
-	int got;
+	ssize_t got;
 	char buffer[NSCD_MAXKEYLEN];
 	
 	/* read the request header, but time out after a short while */
-	got = read_timeout(client, &req, sizeof(req), 5000, 1);
+	got = read_timeout(client, &req, sizeof(req), LONG_TIMEOUT, 1);
 	if(debug)
 	{
 		if(got < 0)
@@ -273,7 +284,7 @@ static int handle_request(int client, uid_t uid)
 	if(req.key_len)
 	{
 		/* read the key, but again time out after a (shorter) while */
-		got = read_timeout(client, buffer, req.key_len, 200, 1);
+		got = read_timeout(client, buffer, req.key_len, SHORT_TIMEOUT, 1);
 		if(got != req.key_len)
 			return -1;
 		/* the last character of the key should be null */
@@ -327,7 +338,10 @@ static void * handle_client_thread(void * arg)
 /* start a new thread to handle this client until it is done */
 int dispatch_client(int client)
 {
-	/* FIXME eventually keep a pool of idle threads around */
+	/* There is a possible performance improvement here: keep a pool of idle
+	 * threads around, so we don't have to create a new one for each client.
+	 * This is what the original nscd did, but it's much more complicated so
+	 * it is not done here. It's not clear how advantageous it would be. */
 	pthread_t thread;
 	if(pthread_create(&thread, NULL, handle_client_thread, (void *) client) < 0)
 		return -1;

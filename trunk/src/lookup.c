@@ -102,7 +102,7 @@ static int marshall_pwd(int error, struct passwd * pwd, void ** reply, int32_t *
 	}
 	else
 	{
-		int offset;
+		size_t offset;
 		
 		header.found = 1;
 		header.pw_name_len = strlen(pwd->pw_name) + 1;
@@ -174,8 +174,8 @@ static int marshall_grp(int error, struct group * grp, void ** reply, int32_t * 
 	}
 	else
 	{
-		int i, offset;
-		int mem_size = 0;
+		size_t offset;
+		int i, mem_size = 0;
 		uint32_t * sizes;
 		
 		header.found = 1;
@@ -247,8 +247,8 @@ static int marshall_hst(int error, struct hostent * hst, void ** reply, int32_t 
 	}
 	else
 	{
-		int i, offset;
-		int mem_size = 0;
+		size_t offset;
+		int i, mem_size = 0;
 		uint32_t * sizes;
 		
 		header.found = 1;
@@ -299,7 +299,8 @@ static int marshall_hst(int error, struct hostent * hst, void ** reply, int32_t 
 
 static int marshall_ai(int error, struct addrinfo * ai, void ** reply, int32_t * reply_len, time_t * refresh_interval)
 {
-	/* NOT IMPLEMENTED */
+	/* This function would marshall the addrinfo structure. Since Google
+	 * doesn't use the host cache anyway, it is not implemented yet. */
 	return -1;
 }
 
@@ -336,8 +337,9 @@ static int generate_pwd_reply(request_header * req, void * key, uid_t uid, void 
 	struct passwd * pwd = NULL;
 	char stack_buffer[512];
 	char * buffer = stack_buffer;
-	int error, buffer_size = sizeof(stack_buffer);
+	size_t buffer_size = sizeof(stack_buffer);
 	long uid_value = -1;
+	int error;
 	
 	if(req->type == GETPWBYUID)
 	{
@@ -370,6 +372,10 @@ static int generate_pwd_reply(request_header * req, void * key, uid_t uid, void 
 			break;
 		if(buffer != stack_buffer)
 			free(buffer);
+		/* The buffer size must be able to grow arbitrarily large
+		 * (system memory permitting) to accomodate arbitrarily large
+		 * data structures. They're all coming from trusted databases
+		 * though, so this can't be used to consume all the RAM. */
 		buffer_size *= 2;
 		buffer = malloc(buffer_size);
 		if(!buffer)
@@ -389,8 +395,9 @@ static int generate_grp_reply(request_header * req, void * key, uid_t uid, void 
 	struct group * grp = NULL;
 	char stack_buffer[1024];
 	char * buffer = stack_buffer;
-	int error, buffer_size = sizeof(stack_buffer);
+	size_t buffer_size = sizeof(stack_buffer);
 	long gid_value = -1;
+	int error;
 	
 	if(req->type == GETGRBYGID)
 	{
@@ -423,6 +430,10 @@ static int generate_grp_reply(request_header * req, void * key, uid_t uid, void 
 			break;
 		if(buffer != stack_buffer)
 			free(buffer);
+		/* The buffer size must be able to grow arbitrarily large
+		 * (system memory permitting) to accomodate arbitrarily large
+		 * data structures. They're all coming from trusted databases
+		 * though, so this can't be used to consume all the RAM. */
 		buffer_size *= 2;
 		buffer = malloc(buffer_size);
 		if(!buffer)
@@ -442,7 +453,7 @@ static int generate_hst_reply(request_header * req, void * key, uid_t uid, void 
 	struct hostent * hst = NULL;
 	char stack_buffer[512];
 	char * buffer = stack_buffer;
-	int buffer_size = sizeof(stack_buffer);
+	size_t buffer_size = sizeof(stack_buffer);
 	int error, h_error = 0;
 	
 	if(req->type == GETHOSTBYADDR && req->key_len != NS_INADDRSZ)
@@ -485,6 +496,10 @@ static int generate_hst_reply(request_header * req, void * key, uid_t uid, void 
 			break;
 		if(buffer != stack_buffer)
 			free(buffer);
+		/* The buffer size must be able to grow arbitrarily large
+		 * (system memory permitting) to accomodate arbitrarily large
+		 * data structures. They're all coming from trusted databases
+		 * though, so this can't be used to consume all the RAM. */
 		buffer_size *= 2;
 		buffer = malloc(buffer_size);
 		if(!buffer)
@@ -499,7 +514,8 @@ static int generate_hst_reply(request_header * req, void * key, uid_t uid, void 
 
 static int generate_ai_reply(request_header * req, void * key, uid_t uid, void ** reply, int32_t * reply_len, time_t * refresh_interval)
 {
-	/* NOT IMPLEMENTED */
+	/* This function would generate the getaddrinfo reply. Since Google
+	 * doesn't use the host cache anyway, it is not implemented yet. */
 	(void) &marshall_ai;
 	return -1;
 }

@@ -27,7 +27,10 @@
 void send_stats(int client, uid_t uid)
 {
 	char * stats = "Compiled on " __DATE__ " at "__TIME__ "\n";
-	/* FIXME send some real stats */
+	/* We don't have any stats to send, but that's OK. If we want to add
+	 * some in the future, put them here. Currently, we send a string, but
+	 * we could change it to be a structure of some sort that is interpreted
+	 * on the other side by get_stats() if necessary. */
 	write(client, stats, strlen(stats) + 1);
 }
 
