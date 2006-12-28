@@ -1,0 +1,811 @@
+#!/bin/sh -e
+
+# DP: Description: Add getpwent()/getgrent() caching to nscd
+# DP: Author: Mike Mammarella <mdm@google.com>
+# DP: Upstream status: Not submitted
+# DP: Status Details: 
+# DP: Date: 3 Aug 2006
+
+if [ $# -ne 2 ]; then
+    echo >&2 "`basename $0`: script expects -patch|-unpatch as argument"
+    exit 1
+fi
+case "$1" in
+    -patch) patch -d "$2" -f --no-backup-if-mismatch -p0 < $0;;
+    -unpatch) patch -d "$2" -f --no-backup-if-mismatch -R -p0 < $0;;
+    *)
+        echo >&2 "`basename $0`: script expects -patch|-unpatch as argument"
+        exit 1
+esac
+exit 0
+
+--- grp/Makefile	2004-09-29 19:19:22.000000000 -0700
++++ grp/Makefile	2006-07-13 14:06:21.000000000 -0700
+@@ -49,7 +49,7 @@
+ 
+ CFLAGS-getgrgid_r.c = -DUSE_NSCD=1 -fexceptions
+ CFLAGS-getgrnam_r.c = -DUSE_NSCD=1 -fexceptions
+-CFLAGS-getgrent_r.c = -fexceptions
++CFLAGS-getgrent_r.c = -DUSE_NSCD=1 -fexceptions
+ CFLAGS-getgrent.c = -fexceptions
+ CFLAGS-fgetgrent.c = -fexceptions
+ CFLAGS-fgetgrent_r.c = -fexceptions -D_IO_MTSAFE_IO
+--- grp/getgrent_r.c	2001-07-05 21:54:46.000000000 -0700
++++ grp/getgrent_r.c	2006-07-13 14:00:17.000000000 -0700
+@@ -25,6 +25,7 @@
+ #define	GETFUNC_NAME	getgrent
+ #define	ENDFUNC_NAME	endgrent
+ #define DATABASE_NAME	group
++#define USE_NSCD_ENT	1
+ #define BUFLEN		NSS_BUFLEN_GROUP
+ 
+ #include "../nss/getXXent_r.c"
+--- nscd/cache.c	2004-09-29 19:20:53.000000000 -0700
++++ nscd/cache.c	2006-08-03 13:10:19.000000000 -0700
+@@ -82,7 +82,7 @@
+ 		{
+ 		  ++table->head->poshit;
+ 
+-		  if (dh->nreloads != 0)
++		  if (here->type != GETPWENT && here->type != GETGRENT)
+ 		    dh->nreloads = 0;
+ 		}
+ 
+@@ -289,6 +289,10 @@
+ 			  readdpwbyuid (table, runp, dh);
+ 			  break;
+ 
++			case GETPWENT:
++			  readdpwent (table, runp, dh);
++			  break;
++
+ 			case GETGRBYNAME:
+ 			  readdgrbyname (table, runp, dh);
+ 			  break;
+@@ -297,6 +301,10 @@
+ 			  readdgrbygid (table, runp, dh);
+ 			  break;
+ 
++			case GETGRENT:
++			  readdgrent (table, runp, dh);
++			  break;
++
+ 			case GETHOSTBYNAME:
+ 			  readdhstbyname (table, runp, dh);
+ 			  break;
+--- nscd/connections.c	2005-02-25 17:24:11.000000000 -0800
++++ nscd/connections.c	2006-07-14 19:14:47.000000000 -0700
+@@ -79,8 +79,10 @@
+ {
+   [GETPWBYNAME] = "GETPWBYNAME",
+   [GETPWBYUID] = "GETPWBYUID",
++  [GETPWENT] = "GETPWENT",
+   [GETGRBYNAME] = "GETGRBYNAME",
+   [GETGRBYGID] = "GETGRBYGID",
++  [GETGRENT] = "GETGRENT",
+   [GETHOSTBYNAME] = "GETHOSTBYNAME",
+   [GETHOSTBYNAMEv6] = "GETHOSTBYNAMEv6",
+   [GETHOSTBYADDR] = "GETHOSTBYADDR",
+@@ -151,8 +153,10 @@
+ {
+   [GETPWBYNAME] = &dbs[pwddb],
+   [GETPWBYUID] = &dbs[pwddb],
++  [GETPWENT] = &dbs[pwddb],
+   [GETGRBYNAME] = &dbs[grpdb],
+   [GETGRBYGID] = &dbs[grpdb],
++  [GETGRENT] = &dbs[grpdb],
+   [GETHOSTBYNAME] = &dbs[hstdb],
+   [GETHOSTBYNAMEv6] = &dbs[hstdb],
+   [GETHOSTBYADDR] = &dbs[hstdb],
+@@ -663,6 +667,7 @@
+   // XXX new conditional.
+   if ((__builtin_expect (req->type, GETPWBYNAME) >= GETPWBYNAME
+        && __builtin_expect (req->type, LASTDBREQ) <= LASTDBREQ)
++      || req->type == GETPWENT || req->type == GETGRENT
+       || req->type == GETAI || req->type == INITGROUPS)
+     {
+       if (__builtin_expect (debug_level, 0) > 0)
+@@ -748,6 +753,10 @@
+       addpwbyuid (db, fd, req, key, uid);
+       break;
+ 
++    case GETPWENT:
++      addpwent (db, fd, req, key, uid);
++      break;
++
+     case GETGRBYNAME:
+       addgrbyname (db, fd, req, key, uid);
+       break;
+@@ -756,6 +765,10 @@
+       addgrbygid (db, fd, req, key, uid);
+       break;
+ 
++    case GETGRENT:
++      addgrent (db, fd, req, key, uid);
++      break;
++
+     case GETHOSTBYNAME:
+       addhstbyname (db, fd, req, key, uid);
+       break;
+--- nscd/grpcache.c	2005-02-25 17:24:11.000000000 -0800
++++ nscd/grpcache.c	2006-08-02 16:40:20.000000000 -0700
+@@ -107,7 +107,8 @@
+ 	     case.  */
+ 	  total = sizeof (notfound);
+ 
+-	  written = TEMP_FAILURE_RETRY (write (fd, &notfound, total));
++	  if (fd != -1)
++	    written = TEMP_FAILURE_RETRY (write (fd, &notfound, total));
+ 
+ 	  dataset = mempool_alloc (db, sizeof (struct dataset) + req->key_len);
+ 	  /* If we cannot permanently store the result, so be it.  */
+@@ -115,12 +116,15 @@
+ 	    {
+ 	      dataset->head.allocsize = sizeof (struct dataset) + req->key_len;
+ 	      dataset->head.recsize = total;
+-	      dataset->head.notfound = true;
++	      dataset->head.notfound = (req->type != GETGRENT);
+ 	      dataset->head.nreloads = 0;
+ 	      dataset->head.usable = true;
+ 
+ 	      /* Compute the timeout time.  */
+-	      dataset->head.timeout = t + db->negtimeout;
++	      if (dataset->head.notfound)
++		dataset->head.timeout = t + db->negtimeout;
++	      else
++		dataset->head.timeout = t + db->postimeout;
+ 
+ 	      /* This is the reply.  */
+ 	      memcpy (&dataset->resp, &notfound, total);
+@@ -191,7 +195,7 @@
+ 			 + gr_mem_cnt * sizeof (uint32_t)
+ 			 + gr_name_len + gr_passwd_len + gr_mem_len_total);
+ 
+-      /* If we refill the cache, first assume the reconrd did not
++      /* If we refill the cache, first assume the record did not
+ 	 change.  Allocate memory on the cache since it is likely
+ 	 discarded anyway.  If it turns out to be necessary to have a
+ 	 new record we can still allocate real memory.  */
+@@ -316,10 +320,10 @@
+ 	     marked with FIRST first.  Otherwise we end up with
+ 	     dangling "pointers" in case a latter hash entry cannot be
+ 	     added.  */
+-	  bool first = req->type == GETGRBYNAME;
++	  bool first = true;
+ 
+ 	  /* If the request was by GID, add that entry first.  */
+-	  if (req->type != GETGRBYNAME)
++	  if (req->type == GETGRBYGID)
+ 	    {
+ 	      if (cache_add (GETGRBYGID, cp, key_offset, &dataset->head, true,
+ 			     db, owner) < 0)
+@@ -329,12 +333,14 @@
+ 		  dataset->head.usable = false;
+ 		  goto out;
+ 		}
++
++	      first = false;
+ 	    }
+ 	  /* If the key is different from the name add a separate entry.  */
+-	  else if (strcmp (key_copy, gr_name) != 0)
++	  else if (req->type == GETGRENT || strcmp (key_copy, gr_name) != 0)
+ 	    {
+-	      if (cache_add (GETGRBYNAME, key_copy, key_len + 1,
+-			     &dataset->head, first, db, owner) < 0)
++	      if (cache_add (req->type, key_copy, key_len + 1,
++			     &dataset->head, true, db, owner) < 0)
+ 		{
+ 		  /* Could not allocate memory.  Make sure the data gets
+ 		     discarded.  */
+@@ -342,17 +348,20 @@
+ 		  goto out;
+ 		}
+ 
++	      /* If this is a GETGRENT query, don't add NAME/GID.  */
++	      if (req->type == GETGRENT)
++		goto out;
+ 	      first = false;
+ 	    }
+ 
+-	  /* We have to add the value for both, byname and byuid.  */
+-	  if (__builtin_expect (cache_add (GETGRBYNAME, gr_name, gr_name_len,
+-					   &dataset->head, first, db, owner)
+-				== 0, 1))
++	  /* We have to add the value for both, byname and bygid.  */
++	  if (__builtin_expect (cache_add (GETGRBYNAME, gr_name,
++					   gr_name_len, &dataset->head, first,
++					   db, owner) == 0, 1))
+ 	    {
+-	      if (req->type == GETGRBYNAME)
++	      if (req->type != GETGRBYGID)
+ 		(void) cache_add (GETGRBYGID, cp, key_offset, &dataset->head,
+-				  req->type != GETGRBYNAME, db, owner);
++				  false, db, owner);
+ 	    }
+ 	  else if (first)
+ 	    /* Could not allocate memory.  Make sure the data gets
+@@ -377,6 +386,7 @@
+ {
+   void *v;
+   gid_t g;
++  int i;
+ };
+ 
+ 
+@@ -386,8 +396,43 @@
+ {
+   if (type == GETGRBYNAME)
+     return __getgrnam_r (key.v, resultbufp, buffer, buflen, grp);
+-  else
++  else if (type == GETGRBYGID)
+     return __getgrgid_r (key.g, resultbufp, buffer, buflen, grp);
++  else
++    {
++      static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
++      static int next_index = -1;
++      int r = 0, retries = 1;
++      key.i = -key.i - 1;
++      if (key.i < 0)
++        return -EINVAL;
++      pthread_mutex_lock (&lock);
++      if (key.i < next_index || next_index == -1)
++        {
++retry:
++          if (next_index > -1)
++            endgrent();
++          setgrent();
++          next_index = 0;
++        }
++      /* It is kind of a waste to throw away all the entries except the
++       * last, but easiest to do that way. */
++      for (; next_index <= key.i; next_index++)
++        if ((r = getgrent_r (resultbufp, buffer, buflen, grp)) != 0)
++          break;
++      /* Paradoxically, errno will be 0 when there is a LDAP/NIS network
++       * error, since the socket will have been close()d. We can use this
++       * to detect whether we should retry or not. */
++      if (r != 0 && r != ERANGE && errno != ENOENT && retries-- > 0)
++        goto retry;
++      if (r != 0 && errno == ENOENT)
++        {
++          endgrent();
++          next_index = -1;
++        }
++      pthread_mutex_unlock (&lock);
++      return r;
++    }
+ }
+ 
+ 
+@@ -461,6 +506,7 @@
+     pthread_seteuid_np (oldeuid);
+ #endif
+ 
++  /* Add the entry to the cache. */
+   cache_addgr (db, fd, req, keystr, grp, uid, he, dh, errval);
+ 
+   if (use_malloc)
+@@ -500,7 +546,7 @@
+   char *ep;
+   gid_t gid = strtoul ((char *) key, &ep, 10);
+ 
+-  if (*(char *) key == '\0' || *ep != '\0')  /* invalid numeric uid */
++  if (*(char *) key == '\0' || *ep != '\0')  /* invalid numeric gid */
+     {
+       if (debug_level > 0)
+         dbg_log (_("Invalid numeric gid \"%s\"!"), (char *) key);
+@@ -534,3 +580,51 @@
+ 
+   addgrbyX (db, -1, &req, u, db->data + he->key, he->owner, he, dh);
+ }
++
++
++void
++addgrent (struct database_dyn *db, int fd, request_header *req,
++	  void *key, uid_t uid)
++{
++  char *ep;
++  int idx = strtoul ((char *) key, &ep, 10);
++
++  if (*(char *) key == '\0' || *ep != '\0')  /* invalid numeric index */
++    {
++      if (debug_level > 0)
++        dbg_log (_("Invalid numeric index \"%s\"!"), (char *) key);
++
++      errno = EINVAL;
++      return;
++    }
++
++  union keytype u = { .i = idx };
++
++  addgrbyX (db, fd, req, u, key, uid, NULL, NULL);
++}
++
++
++void
++readdgrent (struct database_dyn *db, struct hashentry *he,
++	    struct datahead *dh)
++{
++#if 0
++  char *ep;
++  int idx = strtoul (db->data + he->key, &ep, 10);
++
++  /* Since the key has been added before it must be OK.  */
++  assert (*(db->data + he->key) != '\0' && *ep == '\0');
++
++  request_header req =
++    {
++      .type = GETGRENT,
++      .key_len = he->len
++    };
++  union keytype u = { .i = idx };
++
++  addgrbyX (db, -1, &req, u, db->data + he->key, he->owner, he, dh);
++#else
++  dh->timeout = time(NULL) + db->postimeout;
++  dh->nreloads++;
++#endif
++}
+--- nscd/nscd-client.h	2005-02-25 17:24:11.000000000 -0800
++++ nscd/nscd-client.h	2006-07-07 15:38:54.000000000 -0700
+@@ -64,6 +64,8 @@
+   GETFDHST,
+   GETAI,
+   INITGROUPS,
++  GETPWENT,
++  GETGRENT,
+   LASTREQ
+ } request_type;
+ 
+--- nscd/nscd.h	2004-10-15 14:13:19.000000000 -0700
++++ nscd/nscd.h	2006-07-07 16:05:41.000000000 -0700
+@@ -182,20 +182,28 @@
+ 			 void *key, uid_t uid);
+ extern void addpwbyuid (struct database_dyn *db, int fd, request_header *req,
+ 			void *key, uid_t uid);
++extern void addpwent (struct database_dyn *db, int fd, request_header *req,
++		      void *key, uid_t uid);
+ extern void readdpwbyname (struct database_dyn *db, struct hashentry *he,
+ 			   struct datahead *dh);
+ extern void readdpwbyuid (struct database_dyn *db, struct hashentry *he,
+ 			  struct datahead *dh);
++extern void readdpwent (struct database_dyn *db, struct hashentry *he,
++			struct datahead *dh);
+ 
+ /* grpcache.c */
+ extern void addgrbyname (struct database_dyn *db, int fd, request_header *req,
+ 			 void *key, uid_t uid);
+ extern void addgrbygid (struct database_dyn *db, int fd, request_header *req,
+ 			void *key, uid_t uid);
++extern void addgrent (struct database_dyn *db, int fd, request_header *req,
++		      void *key, uid_t uid);
+ extern void readdgrbyname (struct database_dyn *db, struct hashentry *he,
+ 			   struct datahead *dh);
+ extern void readdgrbygid (struct database_dyn *db, struct hashentry *he,
+ 			  struct datahead *dh);
++extern void readdgrent (struct database_dyn *db, struct hashentry *he,
++			struct datahead *dh);
+ 
+ /* hstcache.c */
+ extern void addhstbyname (struct database_dyn *db, int fd, request_header *req,
+--- nscd/nscd_getgr_r.c	2005-02-25 17:24:11.000000000 -0800
++++ nscd/nscd_getgr_r.c	2006-07-13 15:01:18.000000000 -0700
+@@ -66,6 +66,19 @@
+ 		       buffer, buflen, result);
+ }
+ 
++int
++__nscd_getgrent_r (int index, struct group *resultbuf, char *buffer,
++		   size_t buflen, struct group **result)
++{
++  char buf[3 * sizeof (int)];
++  buf[sizeof (buf) - 1] = '\0';
++  char *cp = _itoa_word (index + 1, buf + sizeof (buf) - 1, 10, 0);
++  *--cp = '-';
++
++  return nscd_getgr_r (cp, buf + sizeof (buf) - cp, GETGRENT, resultbuf,
++		       buffer, buflen, result);
++}
++
+ 
+ libc_locked_map_ptr (,__gr_map_handle);
+ /* Note that we only free the structure if necessary.  The memory
+--- nscd/nscd_getpw_r.c	2005-02-25 17:24:11.000000000 -0800
++++ nscd/nscd_getpw_r.c	2006-07-13 15:01:25.000000000 -0700
+@@ -65,6 +65,19 @@
+ 		       buffer, buflen, result);
+ }
+ 
++int
++__nscd_getpwent_r (int index, struct passwd *resultbuf, char *buffer,
++		   size_t buflen, struct passwd **result)
++{
++  char buf[3 * sizeof (int)];
++  buf[sizeof (buf) - 1] = '\0';
++  char *cp = _itoa_word (index + 1, buf + sizeof (buf) - 1, 10, 0);
++  *--cp = '-';
++
++  return nscd_getpw_r (cp, buf + sizeof (buf) - cp, GETPWENT, resultbuf,
++		       buffer, buflen, result);
++}
++
+ 
+ libc_locked_map_ptr (static, map_handle);
+ /* Note that we only free the structure if necessary.  The memory
+--- nscd/nscd_proto.h	2004-09-29 19:23:52.000000000 -0700
++++ nscd/nscd_proto.h	2006-07-13 14:39:36.000000000 -0700
+@@ -42,11 +42,17 @@
+ extern int __nscd_getpwuid_r (uid_t uid, struct passwd *resultbuf,
+ 			      char *buffer,  size_t buflen,
+ 			      struct passwd **result);
++extern int __nscd_getpwent_r (int index, struct passwd *resultbuf,
++			      char *buffer, size_t buflen,
++			      struct passwd **result);
+ extern int __nscd_getgrnam_r (const char *name, struct group *resultbuf,
+ 			      char *buffer, size_t buflen,
+ 			      struct group **result);
+ extern int __nscd_getgrgid_r (gid_t gid, struct group *resultbuf,
+-			      char *buffer,  size_t buflen,
++			      char *buffer, size_t buflen,
++			      struct group **result);
++extern int __nscd_getgrent_r (int index, struct group *resultbuf,
++			      char *buffer, size_t buflen,
+ 			      struct group **result);
+ extern int __nscd_gethostbyname_r (const char *name,
+ 				   struct hostent *resultbuf,
+--- nscd/pwdcache.c	2005-02-25 17:24:11.000000000 -0800
++++ nscd/pwdcache.c	2006-08-02 16:40:18.000000000 -0700
+@@ -122,12 +122,15 @@
+ 	    {
+ 	      dataset->head.allocsize = sizeof (struct dataset) + req->key_len;
+ 	      dataset->head.recsize = total;
+-	      dataset->head.notfound = true;
++	      dataset->head.notfound = (req->type != GETPWENT);
+ 	      dataset->head.nreloads = 0;
+ 	      dataset->head.usable = true;
+ 
+ 	      /* Compute the timeout time.  */
+-	      dataset->head.timeout = t + db->negtimeout;
++	      if (dataset->head.notfound)
++		dataset->head.timeout = t + db->negtimeout;
++	      else
++		dataset->head.timeout = t + db->postimeout;
+ 
+ 	      /* This is the reply.  */
+ 	      memcpy (&dataset->resp, &notfound, total);
+@@ -186,7 +189,7 @@
+       written = total = (sizeof (struct dataset) + pw_name_len + pw_passwd_len
+ 			 + pw_gecos_len + pw_dir_len + pw_shell_len);
+ 
+-      /* If we refill the cache, first assume the reconrd did not
++      /* If we refill the cache, first assume the record did not
+ 	 change.  Allocate memory on the cache since it is likely
+ 	 discarded anyway.  If it turns out to be necessary to have a
+ 	 new record we can still allocate real memory.  */
+@@ -312,10 +315,10 @@
+ 	     marked with FIRST first.  Otherwise we end up with
+ 	     dangling "pointers" in case a latter hash entry cannot be
+ 	     added.  */
+-	  bool first = req->type == GETPWBYNAME;
++	  bool first = true;
+ 
+ 	  /* If the request was by UID, add that entry first.  */
+-	  if (req->type != GETPWBYNAME)
++	  if (req->type == GETPWBYUID)
+ 	    {
+ 	      if (cache_add (GETPWBYUID, cp, key_offset, &dataset->head, true,
+ 			     db, owner) < 0)
+@@ -325,12 +328,14 @@
+ 		  dataset->head.usable = false;
+ 		  goto out;
+ 		}
++
++	      first = false;
+ 	    }
+ 	  /* If the key is different from the name add a separate entry.  */
+-	  else if (strcmp (key_copy, dataset->strdata) != 0)
++	  else if (req->type == GETPWENT || strcmp (key_copy, dataset->strdata) != 0)
+ 	    {
+-	      if (cache_add (GETPWBYNAME, key_copy, key_len + 1,
+-			     &dataset->head, first, db, owner) < 0)
++	      if (cache_add (req->type, key_copy, key_len + 1,
++			     &dataset->head, true, db, owner) < 0)
+ 		{
+ 		  /* Could not allocate memory.  Make sure the data gets
+ 		     discarded.  */
+@@ -338,6 +343,9 @@
+ 		  goto out;
+ 		}
+ 
++	      /* If this is a GETPWENT query, don't add NAME/UID.  */
++	      if (req->type == GETPWENT)
++		goto out;
+ 	      first = false;
+ 	    }
+ 
+@@ -346,9 +354,9 @@
+ 					   pw_name_len, &dataset->head, first,
+ 					   db, owner) == 0, 1))
+ 	    {
+-	      if (req->type == GETPWBYNAME)
++	      if (req->type != GETPWBYUID)
+ 		(void) cache_add (GETPWBYUID, cp, key_offset, &dataset->head,
+-				  req->type != GETPWBYNAME, db, owner);
++				  false, db, owner);
+ 	    }
+ 	  else if (first)
+ 	    /* Could not allocate memory.  Make sure the data gets
+@@ -373,6 +381,7 @@
+ {
+   void *v;
+   uid_t u;
++  int i;
+ };
+ 
+ 
+@@ -382,8 +391,43 @@
+ {
+   if (type == GETPWBYNAME)
+     return __getpwnam_r (key.v, resultbufp, buffer, buflen, pwd);
+-  else
++  else if (type == GETPWBYUID)
+     return __getpwuid_r (key.u, resultbufp, buffer, buflen, pwd);
++  else
++    {
++      static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
++      static int next_index = -1;
++      int r = 0, retries = 1;
++      key.i = -key.i - 1;
++      if (key.i < 0)
++        return -EINVAL;
++      pthread_mutex_lock (&lock);
++      if (key.i < next_index || next_index == -1)
++        {
++retry:
++          if (next_index > -1)
++            endpwent();
++          setpwent();
++          next_index = 0;
++        }
++      /* It is kind of a waste to throw away all the entries except the
++       * last, but easiest to do that way. */
++      for (; next_index <= key.i; next_index++)
++        if ((r = getpwent_r (resultbufp, buffer, buflen, pwd)) != 0)
++          break;
++      /* Paradoxically, errno will be 0 when there is a LDAP/NIS network
++       * error, since the socket will have been close()d. We can use this
++       * to detect whether we should retry or not. */
++      if (r != 0 && r != ERANGE && errno != ENOENT && retries-- > 0)
++        goto retry;
++      if (r != 0 && errno == ENOENT)
++        {
++          endpwent();
++          next_index = -1;
++        }
++      pthread_mutex_unlock (&lock);
++      return r;
++    }
+ }
+ 
+ 
+@@ -531,3 +575,51 @@
+ 
+   addpwbyX (db, -1, &req, u, db->data + he->key, he->owner, he, dh);
+ }
++
++
++void
++addpwent (struct database_dyn *db, int fd, request_header *req,
++	  void *key, uid_t c_uid)
++{
++  char *ep;
++  int idx = strtoul ((char *) key, &ep, 10);
++
++  if (*(char *) key == '\0' || *ep != '\0')  /* invalid numeric index */
++    {
++      if (debug_level > 0)
++        dbg_log (_("Invalid numeric index \"%s\"!"), (char *) key);
++
++      errno = EINVAL;
++      return;
++    }
++
++  union keytype u = { .i = idx };
++
++  addpwbyX (db, fd, req, u, key, c_uid, NULL, NULL);
++}
++
++
++void
++readdpwent (struct database_dyn *db, struct hashentry *he,
++	    struct datahead *dh)
++{
++#if 0
++  char *ep;
++  int idx = strtoul (db->data + he->key, &ep, 10);
++
++  /* Since the key has been added before it must be OK.  */
++  assert (*(db->data + he->key) != '\0' && *ep == '\0');
++
++  request_header req =
++    {
++      .type = GETPWENT,
++      .key_len = he->len
++    };
++  union keytype u = { .i = idx };
++
++  addpwbyX (db, -1, &req, u, db->data + he->key, he->owner, he, dh);
++#else
++  dh->timeout = time(NULL) + db->postimeout;
++  dh->nreloads++;
++#endif
++}
+--- nscd/selinux.c	2004-10-02 14:39:31.000000000 -0700
++++ nscd/selinux.c	2006-08-03 14:30:40.000000000 -0700
+@@ -48,8 +48,10 @@
+ {
+   [GETPWBYNAME] = NSCD__GETPWD,
+   [GETPWBYUID] = NSCD__GETPWD,
++  [GETPWENT] = NSCD__GETPWD,
+   [GETGRBYNAME] = NSCD__GETGRP,
+   [GETGRBYGID] = NSCD__GETGRP,
++  [GETGRENT] = NSCD__GETGRP,
+   [GETHOSTBYNAME] = NSCD__GETHOST,
+   [GETHOSTBYNAMEv6] = NSCD__GETHOST,
+   [GETHOSTBYADDR] = NSCD__GETHOST,
+--- nss/getXXent_r.c	2004-03-10 01:28:25.000000000 -0800
++++ nss/getXXent_r.c	2006-07-13 14:42:37.000000000 -0700
+@@ -21,6 +21,9 @@
+ #include <bits/libc-lock.h>
+ 
+ #include "nsswitch.h"
++#if defined(USE_NSCD) && USE_NSCD_ENT
++# include <nscd/nscd_proto.h>
++#endif
+ 
+ /*******************************************************************\
+ |* Here we assume several symbols to be defined:		   *|
+@@ -38,6 +41,8 @@
+ |* 								   *|
+ |* Optionally the following vars can be defined:		   *|
+ |* 								   *|
++|* USE_NSCD_ENT  - use nscd to cache this type of getXXent call	   *|
++|* 								   *|
+ |* STAYOPEN      - variable declaration for setXXXent function	   *|
+ |* 								   *|
+ |* STAYOPEN_VAR  - variable name for setXXXent function		   *|
+@@ -56,6 +61,15 @@
+ #define NEW(name) NEW1 (name)
+ #define NEW1(name) __new_##name
+ 
++#if defined(USE_NSCD) && USE_NSCD_ENT
++# define NSCD_GETNAME ADD_NSCD (REENTRANT_GETNAME)
++# define ADD_NSCD(name) ADD_NSCD1 (name)
++# define ADD_NSCD1(name) __nscd_##name
++# define NOT_USENSCD_NAME ADD_NOT_NSCDUSE (DATABASE_NAME)
++# define ADD_NOT_NSCDUSE(name) ADD_NOT_NSCDUSE1 (name)
++# define ADD_NOT_NSCDUSE1(name) __nss_not_use_nscd_##name
++#endif
++
+ #define SETFUNC_NAME_STRING STRINGIZE (SETFUNC_NAME)
+ #define GETFUNC_NAME_STRING STRINGIZE (REENTRANT_GETNAME)
+ #define ENDFUNC_NAME_STRING STRINGIZE (ENDFUNC_NAME)
+@@ -102,6 +116,14 @@
+ /* Remember the first service_entry, it's always the same.  */
+ static service_user *startp;
+ 
++#if defined(USE_NSCD) && USE_NSCD_ENT
++/* We need to save the index into the entry list, so we can get the next
++ * one from nscd. Also, in case nscd fails, we need to know how many to
++ * skip locally to get to the same position again. */
++static int next_index;
++static int next_local_index;
++#endif
++
+ #ifdef STAYOPEN_TMP
+ /* We need to remember the last `stayopen' flag given by the user
+    since the `setent' function is only called for the first available
+@@ -109,7 +131,7 @@
+ static STAYOPEN_TMP;
+ #endif
+ 
+-/* Protect above variable against multiple uses at the same time.  */
++/* Protect above variable(s) against multiple uses at the same time.  */
+ __libc_lock_define_initialized (static, lock)
+ 
+ /* The lookup function for the first entry of this service.  */
+@@ -123,6 +145,10 @@
+   int save;
+ 
+   __libc_lock_lock (lock);
++#if defined(USE_NSCD) && USE_NSCD_ENT
++  next_index = 0;
++  next_local_index = 0;
++#endif
+   __nss_setent (SETFUNC_NAME_STRING, DB_LOOKUP_FCT, &nip, &startp,
+ 		&last_nip, STAYOPEN_VAR, STAYOPEN_TMPVAR, NEED__RES);
+ 
+@@ -141,6 +167,10 @@
+   if (startp != NULL)
+     {
+       __libc_lock_lock (lock);
++#if defined(USE_NSCD) && USE_NSCD_ENT
++      next_index = 0;
++      next_local_index = 0;
++#endif
+       __nss_endent (ENDFUNC_NAME_STRING, DB_LOOKUP_FCT, &nip, &startp,
+ 		    &last_nip, NEED__RES);
+       save = errno;
+@@ -158,10 +188,51 @@
+   int save;
+ 
+   __libc_lock_lock (lock);
++
++#if defined(USE_NSCD) && USE_NSCD_ENT
++  if (NOT_USENSCD_NAME > 0 && ++NOT_USENSCD_NAME > NSS_NSCD_RETRY)
++    NOT_USENSCD_NAME = 0;
++
++  if (!NOT_USENSCD_NAME)
++    {
++      status = NSCD_GETNAME (next_index, resbuf, buffer, buflen, result
++			     H_ERRNO_VAR);
++      if (status < 0 && errno == ERANGE)
++	goto out;
++      if (status >= 0)
++	{
++	  next_index++;
++	  goto out;
++	}
++
++      /* skip any local entries we've already gotten from nscd */
++      while (next_local_index < next_index)
++        {
++	  status = __nss_getent_r (GETFUNC_NAME_STRING, SETFUNC_NAME_STRING,
++				   DB_LOOKUP_FCT, &nip, &startp, &last_nip,
++				   STAYOPEN_TMPVAR, NEED__RES, resbuf, buffer,
++				   buflen, (void **) result, H_ERRNO_VAR_P);
++	  if (status < 0)
++	    goto out;
++	  next_local_index++;
++        }
++    }
++#endif
++
+   status = __nss_getent_r (GETFUNC_NAME_STRING, SETFUNC_NAME_STRING,
+ 			   DB_LOOKUP_FCT, &nip, &startp, &last_nip,
+ 			   STAYOPEN_TMPVAR, NEED__RES, resbuf, buffer,
+ 			   buflen, (void **) result, H_ERRNO_VAR_P);
++
++#if defined(USE_NSCD) && USE_NSCD_ENT
++  if (status >= 0)
++    {
++      next_index++;
++      next_local_index++;
++    }
++out:
++#endif
++
+   save = errno;
+   __libc_lock_unlock (lock);
+   __set_errno (save);
+--- pwd/Makefile	2004-02-08 23:33:27.000000000 -0800
++++ pwd/Makefile	2006-07-13 14:23:48.000000000 -0700
+@@ -34,7 +34,7 @@
+ 
+ CFLAGS-getpwuid_r.c = -DUSE_NSCD=1
+ CFLAGS-getpwnam_r.c = -DUSE_NSCD=1
+-CFLAGS-getpwent_r.c = -fexceptions
++CFLAGS-getpwent_r.c = -DUSE_NSCD=1 -fexceptions
+ CFLAGS-getpwent.c = -fexceptions
+ CFLAGS-getpw.c = -fexceptions
+ CFLAGS-fgetpwent_r.c = -D_IO_MTSAFE_IO
+--- pwd/getpwent_r.c	2001-07-05 21:55:39.000000000 -0700
++++ pwd/getpwent_r.c	2006-07-13 14:00:24.000000000 -0700
+@@ -25,6 +25,7 @@
+ #define	GETFUNC_NAME	getpwent
+ #define	ENDFUNC_NAME	endpwent
+ #define DATABASE_NAME	passwd
++#define USE_NSCD_ENT	1
+ #define BUFLEN		NSS_BUFLEN_PASSWD
+ 
+ #include "../nss/getXXent_r.c"

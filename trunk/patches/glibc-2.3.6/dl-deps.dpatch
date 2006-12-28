@@ -1,0 +1,44 @@
+#!/bin/sh -e
+
+# DP: Description: Fix for overflow in dl-deps.c : expand_dst()
+# DP: Author: Douglas Greiman <dgreiman@google.com>
+# DP: Upstream status: Submitted
+# DP: Status Details: 
+# DP: Date: 16 Jun 2006
+
+if [ $# -ne 2 ]; then
+    echo >&2 "`basename $0`: script expects -patch|-unpatch as argument"
+    exit 1
+fi
+case "$1" in
+    -patch) patch -d "$2" -f --no-backup-if-mismatch -p0 < $0;;
+    -unpatch) patch -d "$2" -f --no-backup-if-mismatch -R -p0 < $0;;
+    *)
+        echo >&2 "`basename $0`: script expects -patch|-unpatch as argument"
+        exit 1
+esac
+exit 0
+
+--- elf/dl-deps.c	2006-06-16 14:47:50.000000000 -0700
++++ elf/dl-deps.c	2006-06-16 14:48:06.000000000 -0700
+@@ -101,9 +101,9 @@
+   ({									      \
+     const char *__str = (str);						      \
+     const char *__result = __str;					      \
+-    size_t __cnt = DL_DST_COUNT(__str, 0);				      \
++    size_t __dst_cnt = DL_DST_COUNT(__str, 0);				      \
+ 									      \
+-    if (__cnt != 0)							      \
++    if (__dst_cnt != 0)							      \
+       {									      \
+ 	char *__newp;							      \
+ 									      \
+@@ -113,7 +113,7 @@
+ DST not allowed in SUID/SGID programs"));				      \
+ 									      \
+ 	__newp = (char *) alloca (DL_DST_REQUIRED (l, __str, strlen (__str),  \
+-						   __cnt));		      \
++						   __dst_cnt));		      \
+ 									      \
+ 	__result = _dl_dst_substitute (l, __str, __newp, 0);	      \
+ 									      \
