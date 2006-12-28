@@ -153,7 +153,7 @@ int main(int argc, char * argv[])
 				continue;
 			client = accept(pfd[i].fd, NULL, NULL);
 			if(client < 0)
-				/* FIXME: WTF? */
+				/* odd... poll() says we can accept but accept failed? */
 				continue;
 			if(dispatch_client(client) < 0)
 				close(client);
