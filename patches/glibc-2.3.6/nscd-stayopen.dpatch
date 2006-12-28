@@ -1,0 +1,1045 @@
+#!/bin/sh -e
+
+# DP: Description: Reuse existing nscd sockets when possible
+# DP: Author: Mike Mammarella <mdm@google.com>
+# DP: Upstream status: Not submitted
+# DP: Status Details: 
+# DP: Date: 8 Aug 2006
+
+if [ $# -ne 2 ]; then
+    echo >&2 "`basename $0`: script expects -patch|-unpatch as argument"
+    exit 1
+fi
+case "$1" in
+    -patch) patch -d "$2" -f --no-backup-if-mismatch -p0 < $0;;
+    -unpatch) patch -d "$2" -f --no-backup-if-mismatch -R -p0 < $0;;
+    *)
+        echo >&2 "`basename $0`: script expects -patch|-unpatch as argument"
+        exit 1
+esac
+exit 0
+
+--- nscd/aicache.c	2005-02-25 17:24:11.000000000 -0800
++++ nscd/aicache.c	2006-09-14 19:39:08.449501000 -0700
+@@ -50,7 +50,7 @@
+ };
+ 
+ 
+-static void
++static int
+ addhstaiX (struct database_dyn *db, int fd, request_header *req,
+ 	   void *key, uid_t uid, struct hashentry *he, struct datahead *dh)
+ {
+@@ -365,6 +365,7 @@
+ 		     wait.  */
+ 		  assert (fd != -1);
+ 
++		  total = dataset->head.recsize;
+ 		  writeall (fd, &dataset->resp, total);
+ 		}
+ 
+@@ -458,14 +459,15 @@
+       if (dh != NULL)
+ 	dh->usable = false;
+     }
++  return 1;
+ }
+ 
+ 
+-void
++int
+ addhstai (struct database_dyn *db, int fd, request_header *req, void *key,
+ 	  uid_t uid)
+ {
+-  addhstaiX (db, fd, req, key, uid, NULL, NULL);
++  return addhstaiX (db, fd, req, key, uid, NULL, NULL);
+ }
+ 
+ 
+--- nscd/connections.c	2006-09-14 19:36:55.984108000 -0700
++++ nscd/connections.c	2006-09-14 19:39:08.476488000 -0700
+@@ -27,6 +27,7 @@
+ #include <grp.h>
+ #include <libintl.h>
+ #include <pthread.h>
++#include <signal.h>
+ #include <pwd.h>
+ #include <resolv.h>
+ #include <stdio.h>
+@@ -70,6 +71,7 @@
+ static int server_ngroups;
+ 
+ static pthread_attr_t attr;
++static pthread_t main_thread;
+ 
+ static void begin_drop_privileges (void);
+ static void finish_drop_privileges (void);
+@@ -178,6 +180,9 @@
+ /* Maximum number of threads to use.  */
+ int max_nthreads = 32;
+ 
++/* Total size of fdlist.  */
++static unsigned int nconns;
++
+ /* Socket for incoming connections.  */
+ static int sock;
+ 
+@@ -640,7 +645,7 @@
+ 
+ 
+ /* Handle new request.  */
+-static void
++static int
+ handle_request (int fd, request_header *req, void *key, uid_t uid)
+ {
+   if (__builtin_expect (req->version, NSCD_VERSION) != NSCD_VERSION)
+@@ -649,7 +654,7 @@
+ 	dbg_log (_("\
+ cannot handle old request version %d; current version is %d"),
+ 		 req->version, NSCD_VERSION);
+-      return;
++      return -1;
+     }
+ 
+   /* Make the SELinux check before we go on to the standard checks.  We
+@@ -659,7 +664,7 @@
+       && __builtin_expect (req->type, GETPWBYNAME) >= GETPWBYNAME
+       && __builtin_expect (req->type, LASTREQ) < LASTREQ
+       && nscd_request_avc_has_perm (fd, req->type) != 0)
+-    return;
++    return -1;
+ 
+   struct database_dyn *db = serv2db[req->type];
+ 
+@@ -698,9 +703,10 @@
+ 	      char buf[256];
+ 	      dbg_log (_("cannot write result: %s"),
+ 		       strerror_r (errno, buf, sizeof (buf)));
++	      return -1;
+ 	    }
+ 
+-	  return;
++	  return 0;
+ 	}
+ 
+       /* Be sure we can read the data.  */
+@@ -716,6 +722,7 @@
+ 						 db, uid);
+       if (cached != NULL)
+ 	{
++	  int r = 0;
+ 	  /* Hurray it's in the cache.  */
+ 	  if (writeall (fd, cached->data, cached->recsize)
+ 	      != cached->recsize
+@@ -725,11 +732,12 @@
+ 	      char buf[256];
+ 	      dbg_log (_("cannot write result: %s"),
+ 		       strerror_r (errno, buf, sizeof (buf)));
++	      r = -1;
+ 	    }
+ 
+ 	  pthread_rwlock_unlock (&db->lock);
+ 
+-	  return;
++	  return r;
+ 	}
+ 
+       pthread_rwlock_unlock (&db->lock);
+@@ -743,54 +751,55 @@
+     }
+ 
+   /* Handle the request.  */
++  int r = -1;
+   switch (req->type)
+     {
+     case GETPWBYNAME:
+-      addpwbyname (db, fd, req, key, uid);
++      r = addpwbyname (db, fd, req, key, uid);
+       break;
+ 
+     case GETPWBYUID:
+-      addpwbyuid (db, fd, req, key, uid);
++      r = addpwbyuid (db, fd, req, key, uid);
+       break;
+ 
+     case GETPWENT:
+-      addpwent (db, fd, req, key, uid);
++      r = addpwent (db, fd, req, key, uid);
+       break;
+ 
+     case GETGRBYNAME:
+-      addgrbyname (db, fd, req, key, uid);
++      r = addgrbyname (db, fd, req, key, uid);
+       break;
+ 
+     case GETGRBYGID:
+-      addgrbygid (db, fd, req, key, uid);
++      r = addgrbygid (db, fd, req, key, uid);
+       break;
+ 
+     case GETGRENT:
+-      addgrent (db, fd, req, key, uid);
++      r = addgrent (db, fd, req, key, uid);
+       break;
+ 
+     case GETHOSTBYNAME:
+-      addhstbyname (db, fd, req, key, uid);
++      r = addhstbyname (db, fd, req, key, uid);
+       break;
+ 
+     case GETHOSTBYNAMEv6:
+-      addhstbynamev6 (db, fd, req, key, uid);
++      r = addhstbynamev6 (db, fd, req, key, uid);
+       break;
+ 
+     case GETHOSTBYADDR:
+-      addhstbyaddr (db, fd, req, key, uid);
++      r = addhstbyaddr (db, fd, req, key, uid);
+       break;
+ 
+     case GETHOSTBYADDRv6:
+-      addhstbyaddrv6 (db, fd, req, key, uid);
++      r = addhstbyaddrv6 (db, fd, req, key, uid);
+       break;
+ 
+     case GETAI:
+-      addhstai (db, fd, req, key, uid);
++      r = addhstai (db, fd, req, key, uid);
+       break;
+ 
+     case INITGROUPS:
+-      addinitgroups (db, fd, req, key, uid);
++      r = addinitgroups (db, fd, req, key, uid);
+       break;
+ 
+     case GETSTAT:
+@@ -834,6 +843,7 @@
+ 	  else
+ 	    termination_handler (0);
+ 	}
++      r = 1;
+       break;
+ 
+     case GETFDPW:
+@@ -842,12 +852,14 @@
+ #ifdef SCM_RIGHTS
+       send_ro_fd (serv2db[req->type], key, fd);
+ #endif
++      r = 1;
+       break;
+ 
+     default:
+       /* Ignore the command, it's nothing we know.  */
+       break;
+     }
++  return r;
+ }
+ 
+ 
+@@ -993,6 +1005,8 @@
+ static struct fdlist *fdlist;
+ /* List of currently ready-to-read file descriptors.  */
+ static struct fdlist *readylist;
++/* List of file descriptors we just answered.  */
++static struct fdlist *donelist;
+ 
+ /* Conditional variable and mutex to signal availability of entries in
+    READYLIST.  The condvar is initialized dynamically since we might
+@@ -1000,6 +1014,9 @@
+ static pthread_cond_t readylist_cond;
+ static pthread_mutex_t readylist_lock = PTHREAD_MUTEX_INITIALIZER;
+ 
++static pthread_cond_t donelist_cond;
++static pthread_mutex_t donelist_lock = PTHREAD_MUTEX_INITIALIZER;
++
+ /* The clock to use with the condvar.  */
+ static clockid_t timeout_clock = CLOCK_REALTIME;
+ 
+@@ -1007,6 +1024,47 @@
+ static unsigned long int nready;
+ 
+ 
++static void
++fd_done (int fd)
++{
++  pthread_mutex_lock (&donelist_lock);
++
++  /* Find an empty entry in FDLIST.  */
++  size_t inner;
++  for (inner = 0; inner < nconns; ++inner)
++    if (fdlist[inner].next == NULL)
++      break;
++  assert (inner < nconns);
++
++  fdlist[inner].fd = fd;
++
++  if (donelist == NULL)
++    donelist = fdlist[inner].next = &fdlist[inner];
++  else
++    {
++      fdlist[inner].next = donelist->next;
++      donelist = donelist->next = &fdlist[inner];
++    }
++
++  while (donelist)
++    {
++      struct timespec wakeup;
++      clock_gettime (timeout_clock, &wakeup);
++      if ((wakeup.tv_nsec += 500000000) >= 1000000000)
++	{
++	  wakeup.tv_nsec -= 1000000000;
++	  wakeup.tv_sec++;
++	}
++      /* Interrupt up the main thread so it adds the descriptor to the poll set.  */
++      pthread_kill (main_thread, SIGIO);
++      if (pthread_cond_timedwait (&donelist_cond, &donelist_lock, &wakeup) == 0)
++	break;
++    }
++
++  pthread_mutex_unlock (&donelist_lock);
++}
++
++
+ /* This is the main loop.  It is replicated in different threads but the
+    `poll' call makes sure only one thread handles an incoming connection.  */
+ static void *
+@@ -1177,12 +1235,19 @@
+ 	    }
+ 
+ 	  /* Phew, we got all the data, now process it.  */
+-	  handle_request (fd, &req, keybuf, uid);
++	  int r = handle_request (fd, &req, keybuf, uid);
++	  /* Nonzero means to close the socket now.  */
++	  if (r == 0)
++	    {
++	      fd_done (fd);
++	      fd = -1;
++	    }
+ 	}
+ 
+     close_and_out:
+       /* We are done.  */
+-      close (fd);
++      if (fd != -1)
++	close (fd);
+ 
+       /* Check whether we should be pruning the cache. */
+       assert (run_prune || to == 0);
+@@ -1215,8 +1280,6 @@
+ }
+ 
+ 
+-static unsigned int nconns;
+-
+ static void
+ fd_ready (int fd)
+ {
+@@ -1266,7 +1329,6 @@
+     pthread_cond_signal (&readylist_cond);
+ }
+ 
+-
+ /* Check whether restarting should happen.  */
+ static inline int
+ restart_p (time_t now)
+@@ -1329,6 +1391,8 @@
+ 		    ++firstfree;
+ 		  while (firstfree < nused && conns[firstfree].fd != -1);
+ 		}
++	      else if (fd >= 0)
++		close (fd);
+ 
+ 	      --n;
+ 	    }
+@@ -1351,6 +1415,40 @@
+ 	      }
+ 	}
+ 
++      pthread_mutex_lock (&donelist_lock);
++      while (donelist)
++	{
++	  int fd;
++	  struct fdlist *it = donelist->next;
++	  if (donelist->next == donelist)
++	    {
++	      /* Just one entry on the list.  */
++	      donelist = NULL;
++	      pthread_cond_broadcast (&donelist_cond);
++	    }
++	  else
++	    donelist->next = it->next;
++
++	  fd = it->fd;
++	  it->next = NULL;
++
++	  if (firstfree < nconns)
++	    {
++	      conns[firstfree].fd = fd;
++	      conns[firstfree].events = POLLRDNORM;
++	      starttime[firstfree] = now;
++	      if (firstfree >= nused)
++		nused = firstfree + 1;
++
++	      do
++		++firstfree;
++	      while (firstfree < nused && conns[firstfree].fd != -1);
++	    }
++	  else
++	    close (fd);
++	}
++      pthread_mutex_unlock (&donelist_lock);
++
+       /* Now find entries which have timed out.  */
+       assert (nused > 0);
+ 
+@@ -1416,7 +1514,7 @@
+ 
+ 	    if (fd >= 0)
+ 	      {
+-		/* Try to add the  new descriptor.  */
++		/* Try to add the new descriptor.  */
+ 		ev.data.fd = fd;
+ 		if (fd >= nconns
+ 		    || epoll_ctl (efd, EPOLL_CTL_ADD, fd, &ev) == -1)
+@@ -1454,6 +1552,43 @@
+ 	    --nused;
+ 	  }
+ 
++      pthread_mutex_lock (&donelist_lock);
++      while (donelist)
++	{
++	  int fd;
++	  struct fdlist *it = donelist->next;
++	  if (donelist->next == donelist)
++	    {
++	      /* Just one entry on the list.  */
++	      donelist = NULL;
++	      pthread_cond_broadcast (&donelist_cond);
++	    }
++	  else
++	    donelist->next = it->next;
++
++	  fd = it->fd;
++	  it->next = NULL;
++
++	  /* Try to add the descriptor.  */
++	  ev.data.fd = fd;
++	  if (fd >= nconns
++	      || epoll_ctl (efd, EPOLL_CTL_ADD, fd, &ev) == -1)
++	    /* The descriptor is too large or something went
++	       wrong.  Close the descriptor.  */
++	    close (fd);
++	  else
++	    {
++	      /* Remember when we accepted the connection.  */
++	      starttime[fd] = now;
++
++	      if (fd > highest)
++		highest = fd;
++
++	      ++nused;
++	    }
++	}
++      pthread_mutex_unlock (&donelist_lock);
++
+       /*  Now look for descriptors for accepted connections which have
+ 	  no reply in too long of a time.  */
+       time_t laststart = now - ACCEPT_TIMEOUT;
+@@ -1480,6 +1615,13 @@
+ #endif
+ 
+ 
++/* Do-nothing signal handler.  */
++static void
++do_nothing (int signal)
++{
++}
++
++
+ /* Start all the threads we want.  The initial process is thread no. 1.  */
+ void
+ start_threads (void)
+@@ -1505,6 +1647,7 @@
+ #endif
+ 
+   pthread_cond_init (&readylist_cond, &condattr);
++  pthread_cond_init (&donelist_cond, &condattr);
+   pthread_condattr_destroy (&condattr);
+ 
+ 
+@@ -1519,6 +1662,10 @@
+   if (debug_level == 0)
+     nthreads = MAX (nthreads, lastdb);
+ 
++  /* Prepare for worker threads to wake up the main thread with SIGIO.  */
++  signal(SIGIO, do_nothing);
++  main_thread = pthread_self();
++  
+   int nfailed = 0;
+   for (long int i = 0; i < nthreads; ++i)
+     {
+--- nscd/grpcache.c	2006-09-14 19:36:56.003081000 -0700
++++ nscd/grpcache.c	2006-09-14 19:39:08.480471000 -0700
+@@ -68,7 +68,7 @@
+ };
+ 
+ 
+-static void
++static int
+ cache_addgr (struct database_dyn *db, int fd, request_header *req,
+ 	     const void *key, struct group *grp, uid_t owner,
+ 	     struct hashentry *he, struct datahead *dh, int errval)
+@@ -296,6 +296,7 @@
+ 	     unnecessarily let the receiver wait.  */
+ 	  assert (fd != -1);
+ 
++	  total = dataset->head.recsize;
+ 	  written = writeall (fd, &dataset->resp, total);
+ 	}
+ 
+@@ -378,7 +379,9 @@
+       char buf[256];
+       dbg_log (_("short write in %s: %s"),  __FUNCTION__,
+ 	       strerror_r (errno, buf, sizeof (buf)));
++      return -1;
+     }
++  return 0;
+ }
+ 
+ 
+@@ -436,7 +439,7 @@
+ }
+ 
+ 
+-static void
++static int
+ addgrbyX (struct database_dyn *db, int fd, request_header *req,
+ 	  union keytype key, const char *keystr, uid_t uid,
+ 	  struct hashentry *he, struct datahead *dh)
+@@ -507,20 +510,22 @@
+ #endif
+ 
+   /* Add the entry to the cache. */
+-  cache_addgr (db, fd, req, keystr, grp, uid, he, dh, errval);
++  errval = cache_addgr (db, fd, req, keystr, grp, uid, he, dh, errval);
+ 
+   if (use_malloc)
+     free (buffer);
++
++  return errval;
+ }
+ 
+ 
+-void
++int
+ addgrbyname (struct database_dyn *db, int fd, request_header *req,
+ 	     void *key, uid_t uid)
+ {
+   union keytype u = { .v = key };
+ 
+-  addgrbyX (db, fd, req, u, key, uid, NULL, NULL);
++  return addgrbyX (db, fd, req, u, key, uid, NULL, NULL);
+ }
+ 
+ 
+@@ -539,7 +544,7 @@
+ }
+ 
+ 
+-void
++int
+ addgrbygid (struct database_dyn *db, int fd, request_header *req,
+ 	    void *key, uid_t uid)
+ {
+@@ -552,12 +557,12 @@
+         dbg_log (_("Invalid numeric gid \"%s\"!"), (char *) key);
+ 
+       errno = EINVAL;
+-      return;
++      return -errno;
+     }
+ 
+   union keytype u = { .g = gid };
+ 
+-  addgrbyX (db, fd, req, u, key, uid, NULL, NULL);
++  return addgrbyX (db, fd, req, u, key, uid, NULL, NULL);
+ }
+ 
+ 
+@@ -582,7 +587,7 @@
+ }
+ 
+ 
+-void
++int
+ addgrent (struct database_dyn *db, int fd, request_header *req,
+ 	  void *key, uid_t uid)
+ {
+@@ -595,12 +600,12 @@
+         dbg_log (_("Invalid numeric index \"%s\"!"), (char *) key);
+ 
+       errno = EINVAL;
+-      return;
++      return -errno;
+     }
+ 
+   union keytype u = { .i = idx };
+ 
+-  addgrbyX (db, fd, req, u, key, uid, NULL, NULL);
++  return addgrbyX (db, fd, req, u, key, uid, NULL, NULL);
+ }
+ 
+ 
+--- nscd/hstcache.c	2005-02-25 17:24:11.000000000 -0800
++++ nscd/hstcache.c	2006-09-14 19:39:08.483472000 -0700
+@@ -75,7 +75,7 @@
+ };
+ 
+ 
+-static void
++static int
+ cache_addhst (struct database_dyn *db, int fd, request_header *req,
+ 	      const void *key, struct hostent *hst, uid_t owner,
+ 	      struct hashentry *he, struct datahead *dh, int errval)
+@@ -198,7 +198,7 @@
+ 
+       if (h_addr_list_cnt == 0)
+ 	/* Invalid entry.  */
+-	return;
++	return -1;
+ 
+       total += (sizeof (struct dataset)
+ 		+ h_name_len
+@@ -327,6 +327,7 @@
+ 	     unnecessarily keep the receiver waiting.  */
+ 	  assert (fd != -1);
+ 
++	  total = dataset->head.recsize;
+ 	  written = writeall (fd, &dataset->resp, total);
+ 	}
+ 
+@@ -385,7 +386,9 @@
+       char buf[256];
+       dbg_log (_("short write in %s: %s"),  __FUNCTION__,
+ 	       strerror_r (errno, buf, sizeof (buf)));
++      return -1;
+     }
++  return 0;
+ }
+ 
+ 
+@@ -407,7 +410,7 @@
+ }
+ 
+ 
+-static void
++static int
+ addhstbyX (struct database_dyn *db, int fd, request_header *req,
+ 	   void *key, uid_t uid, struct hashentry *he, struct datahead *dh)
+ {
+@@ -485,19 +488,21 @@
+     pthread_seteuid_np (oldeuid);
+ #endif
+ 
+-  cache_addhst (db, fd, req, key, hst, uid, he, dh,
+-		h_errno == TRY_AGAIN ? errval : 0);
++  errval = cache_addhst (db, fd, req, key, hst, uid, he, dh,
++			 h_errno == TRY_AGAIN ? errval : 0);
+ 
+   if (use_malloc)
+     free (buffer);
++
++  return errval;
+ }
+ 
+ 
+-void
++int
+ addhstbyname (struct database_dyn *db, int fd, request_header *req,
+ 	      void *key, uid_t uid)
+ {
+-  addhstbyX (db, fd, req, key, uid, NULL, NULL);
++  return addhstbyX (db, fd, req, key, uid, NULL, NULL);
+ }
+ 
+ 
+@@ -515,11 +520,11 @@
+ }
+ 
+ 
+-void
++int
+ addhstbyaddr (struct database_dyn *db, int fd, request_header *req,
+ 	      void *key, uid_t uid)
+ {
+-  addhstbyX (db, fd, req, key, uid, NULL, NULL);
++  return addhstbyX (db, fd, req, key, uid, NULL, NULL);
+ }
+ 
+ 
+@@ -537,11 +542,11 @@
+ }
+ 
+ 
+-void
++int
+ addhstbynamev6 (struct database_dyn *db, int fd, request_header *req,
+ 		void *key, uid_t uid)
+ {
+-  addhstbyX (db, fd, req, key, uid, NULL, NULL);
++  return addhstbyX (db, fd, req, key, uid, NULL, NULL);
+ }
+ 
+ 
+@@ -559,11 +564,11 @@
+ }
+ 
+ 
+-void
++int
+ addhstbyaddrv6 (struct database_dyn *db, int fd, request_header *req,
+ 		void *key, uid_t uid)
+ {
+-  addhstbyX (db, fd, req, key, uid, NULL, NULL);
++  return addhstbyX (db, fd, req, key, uid, NULL, NULL);
+ }
+ 
+ 
+--- nscd/initgrcache.c	2005-02-25 17:24:11.000000000 -0800
++++ nscd/initgrcache.c	2006-09-14 19:39:08.487466000 -0700
+@@ -49,7 +49,7 @@
+ #include "../grp/compat-initgroups.c"
+ 
+ 
+-static void
++static int
+ addinitgroupsX (struct database_dyn *db, int fd, request_header *req,
+ 		void *key, uid_t uid, struct hashentry *he,
+ 		struct datahead *dh)
+@@ -343,6 +343,7 @@
+ 	     unnecessarily let the receiver wait.  */
+ 	  assert (fd != -1);
+ 
++	  total = dataset->head.recsize;
+ 	  written = writeall (fd, &dataset->resp, total);
+ 	}
+ 
+@@ -381,15 +382,17 @@
+       char buf[256];
+       dbg_log (_("short write in %s: %s"), __FUNCTION__,
+ 	       strerror_r (errno, buf, sizeof (buf)));
++      return -1;
+     }
++  return 0;
+ }
+ 
+ 
+-void
++int
+ addinitgroups (struct database_dyn *db, int fd, request_header *req, void *key,
+ 	       uid_t uid)
+ {
+-  addinitgroupsX (db, fd, req, key, uid, NULL, NULL);
++  return addinitgroupsX (db, fd, req, key, uid, NULL, NULL);
+ }
+ 
+ 
+--- nscd/nscd-client.h	2006-09-14 19:36:56.006080000 -0700
++++ nscd/nscd-client.h	2006-09-14 19:39:08.490468000 -0700
+@@ -274,6 +274,8 @@
+ extern int __nscd_open_socket (const char *key, size_t keylen,
+ 			       request_type type, void *response,
+ 			       size_t responselen) attribute_hidden;
++/* Push an old nscd socket back to be reused.  */
++extern void __nscd_reuse_socket (int fd);
+ 
+ /* Get reference of mapping.  */
+ extern struct mapped_database *__nscd_get_map_ref (request_type type,
+--- nscd/nscd.h	2006-09-14 19:36:56.009076000 -0700
++++ nscd/nscd.h	2006-09-14 19:39:08.493459000 -0700
+@@ -178,12 +178,12 @@
+ extern void prune_cache (struct database_dyn *table, time_t now);
+ 
+ /* pwdcache.c */
+-extern void addpwbyname (struct database_dyn *db, int fd, request_header *req,
+-			 void *key, uid_t uid);
+-extern void addpwbyuid (struct database_dyn *db, int fd, request_header *req,
++extern int addpwbyname (struct database_dyn *db, int fd, request_header *req,
+ 			void *key, uid_t uid);
+-extern void addpwent (struct database_dyn *db, int fd, request_header *req,
+-		      void *key, uid_t uid);
++extern int addpwbyuid (struct database_dyn *db, int fd, request_header *req,
++		       void *key, uid_t uid);
++extern int addpwent (struct database_dyn *db, int fd, request_header *req,
++		     void *key, uid_t uid);
+ extern void readdpwbyname (struct database_dyn *db, struct hashentry *he,
+ 			   struct datahead *dh);
+ extern void readdpwbyuid (struct database_dyn *db, struct hashentry *he,
+@@ -192,12 +192,12 @@
+ 			struct datahead *dh);
+ 
+ /* grpcache.c */
+-extern void addgrbyname (struct database_dyn *db, int fd, request_header *req,
+-			 void *key, uid_t uid);
+-extern void addgrbygid (struct database_dyn *db, int fd, request_header *req,
++extern int addgrbyname (struct database_dyn *db, int fd, request_header *req,
+ 			void *key, uid_t uid);
+-extern void addgrent (struct database_dyn *db, int fd, request_header *req,
+-		      void *key, uid_t uid);
++extern int addgrbygid (struct database_dyn *db, int fd, request_header *req,
++		       void *key, uid_t uid);
++extern int addgrent (struct database_dyn *db, int fd, request_header *req,
++		     void *key, uid_t uid);
+ extern void readdgrbyname (struct database_dyn *db, struct hashentry *he,
+ 			   struct datahead *dh);
+ extern void readdgrbygid (struct database_dyn *db, struct hashentry *he,
+@@ -206,14 +206,14 @@
+ 			struct datahead *dh);
+ 
+ /* hstcache.c */
+-extern void addhstbyname (struct database_dyn *db, int fd, request_header *req,
+-			  void *key, uid_t uid);
+-extern void addhstbyaddr (struct database_dyn *db, int fd, request_header *req,
+-			  void *key, uid_t uid);
+-extern void addhstbynamev6 (struct database_dyn *db, int fd,
+-			    request_header *req, void *key, uid_t uid);
+-extern void addhstbyaddrv6 (struct database_dyn *db, int fd,
+-			    request_header *req, void *key, uid_t uid);
++extern int addhstbyname (struct database_dyn *db, int fd, request_header *req,
++			 void *key, uid_t uid);
++extern int addhstbyaddr (struct database_dyn *db, int fd, request_header *req,
++			 void *key, uid_t uid);
++extern int addhstbynamev6 (struct database_dyn *db, int fd,
++			   request_header *req, void *key, uid_t uid);
++extern int addhstbyaddrv6 (struct database_dyn *db, int fd,
++			   request_header *req, void *key, uid_t uid);
+ extern void readdhstbyname (struct database_dyn *db, struct hashentry *he,
+ 			    struct datahead *dh);
+ extern void readdhstbyaddr (struct database_dyn *db, struct hashentry *he,
+@@ -224,15 +224,15 @@
+ 			      struct datahead *dh);
+ 
+ /* aicache.c */
+-extern void addhstai (struct database_dyn *db, int fd, request_header *req,
+-		      void *key, uid_t uid);
++extern int addhstai (struct database_dyn *db, int fd, request_header *req,
++		     void *key, uid_t uid);
+ extern void readdhstai (struct database_dyn *db, struct hashentry *he,
+ 			struct datahead *dh);
+ 
+ 
+ /* initgrcache.c */
+-extern void addinitgroups (struct database_dyn *db, int fd,
+-			   request_header *req, void *key, uid_t uid);
++extern int addinitgroups (struct database_dyn *db, int fd,
++			  request_header *req, void *key, uid_t uid);
+ extern void readdinitgroups (struct database_dyn *db, struct hashentry *he,
+ 			     struct datahead *dh);
+ 
+--- nscd/nscd_getgr_r.c	2006-09-14 19:36:56.012079000 -0700
++++ nscd/nscd_getgr_r.c	2006-09-14 19:39:08.496456000 -0700
+@@ -253,7 +253,11 @@
+ 	      retval = ENOENT;
+ 	    }
+ 	  else
+-	    *result = resultbuf;
++	    {
++	      __nscd_reuse_socket (sock);
++	      sock = -1;
++	      *result = resultbuf;
++	    }
+ 	}
+       else
+ 	{
+--- nscd/nscd_getpw_r.c	2006-09-14 19:36:56.015073000 -0700
++++ nscd/nscd_getpw_r.c	2006-09-14 19:39:08.499451000 -0700
+@@ -194,7 +194,11 @@
+ 	      retval = ENOENT;
+ 	    }
+ 	  else
+-	    *result = resultbuf;
++	    {
++	      __nscd_reuse_socket (sock);
++	      sock = -1;
++	      *result = resultbuf;
++	    }
+ 	}
+       else
+ 	{
+--- nscd/nscd_helper.c	2006-09-14 16:29:45.812773000 -0700
++++ nscd/nscd_helper.c	2006-09-14 19:39:08.504447000 -0700
+@@ -388,6 +388,8 @@
+ }
+ 
+ 
++static int nscd_socket = -1;
++
+ /* Create a socket connected to a name. */
+ int
+ __nscd_open_socket (const char *key, size_t keylen, request_type type,
+@@ -395,7 +397,20 @@
+ {
+   int saved_errno = errno;
+ 
+-  int sock = open_socket ();
++  int sock = atomic_exchange_acq(&nscd_socket, -1);
++  struct pollfd fds[1];
++  if (sock < 0)
++    goto new_socket;
++  fds[0].fd = sock;
++  /* Make sure the socket is ready for writing only.  */
++  fds[0].events = POLLIN | POLLOUT | POLLERR | POLLHUP;
++  if (__poll (fds, 1, 0) <= 0 || fds[0].revents != POLLOUT)
++    {
++      close_not_cancel_no_status (sock);
++new_socket:
++      sock = open_socket ();
++    }
++
+   if (sock >= 0)
+     {
+       request_header req;
+@@ -426,3 +441,16 @@
+ 
+   return -1;
+ }
++
++/* Push an old nscd socket back to be reused.  */
++void
++__nscd_reuse_socket (int fd)
++{
++  int saved_errno = errno;
++
++  int old_socket = atomic_exchange_acq(&nscd_socket, fd);
++  if (old_socket >= 0)
++    close_not_cancel_no_status (old_socket);
++
++  __set_errno (saved_errno);
++}
+--- nscd/nscd_initgroups.c	2005-02-25 17:24:11.000000000 -0800
++++ nscd/nscd_initgroups.c	2006-09-14 19:39:08.509442000 -0700
+@@ -113,7 +113,11 @@
+ 	  if ((size_t) __readall (sock, *groupsp, initgr_resp->ngrps
+ 						  * sizeof (gid_t))
+ 	      == initgr_resp->ngrps * sizeof (gid_t))
+-	    retval = initgr_resp->ngrps;
++	    {
++	      __nscd_reuse_socket (sock);
++	      sock = -1;
++	      retval = initgr_resp->ngrps;
++	    }
+ 	}
+       else
+ 	{
+--- nscd/pwdcache.c	2006-09-14 19:36:56.022063000 -0700
++++ nscd/pwdcache.c	2006-09-14 19:39:08.512443000 -0700
+@@ -74,7 +74,7 @@
+ };
+ 
+ 
+-static void
++static int
+ cache_addpw (struct database_dyn *db, int fd, request_header *req,
+ 	     const void *key, struct passwd *pwd, uid_t owner,
+ 	     struct hashentry *he, struct datahead *dh, int errval)
+@@ -290,6 +290,7 @@
+ 	     unnecessarily let the receiver wait.  */
+ 	  assert (fd != -1);
+ 
++	  total = dataset->head.recsize;
+ 	  written = writeall (fd, &dataset->resp, total);
+ 	}
+ 
+@@ -373,7 +374,9 @@
+       char buf[256];
+       dbg_log (_("short write in %s: %s"),  __FUNCTION__,
+ 	       strerror_r (errno, buf, sizeof (buf)));
++      return -1;
+     }
++  return 0;
+ }
+ 
+ 
+@@ -431,7 +434,7 @@
+ }
+ 
+ 
+-static void
++static int
+ addpwbyX (struct database_dyn *db, int fd, request_header *req,
+ 	  union keytype key, const char *keystr, uid_t c_uid,
+ 	  struct hashentry *he, struct datahead *dh)
+@@ -502,20 +505,22 @@
+ #endif
+ 
+   /* Add the entry to the cache.  */
+-  cache_addpw (db, fd, req, keystr, pwd, c_uid, he, dh, errval);
++  errval = cache_addpw (db, fd, req, keystr, pwd, c_uid, he, dh, errval);
+ 
+   if (use_malloc)
+     free (buffer);
++
++  return errval;
+ }
+ 
+ 
+-void
++int
+ addpwbyname (struct database_dyn *db, int fd, request_header *req,
+ 	     void *key, uid_t c_uid)
+ {
+   union keytype u = { .v = key };
+ 
+-  addpwbyX (db, fd, req, u, key, c_uid, NULL, NULL);
++  return addpwbyX (db, fd, req, u, key, c_uid, NULL, NULL);
+ }
+ 
+ 
+@@ -534,7 +539,7 @@
+ }
+ 
+ 
+-void
++int
+ addpwbyuid (struct database_dyn *db, int fd, request_header *req,
+ 	    void *key, uid_t c_uid)
+ {
+@@ -547,12 +552,12 @@
+         dbg_log (_("Invalid numeric uid \"%s\"!"), (char *) key);
+ 
+       errno = EINVAL;
+-      return;
++      return -errno;
+     }
+ 
+   union keytype u = { .u = uid };
+ 
+-  addpwbyX (db, fd, req, u, key, c_uid, NULL, NULL);
++  return addpwbyX (db, fd, req, u, key, c_uid, NULL, NULL);
+ }
+ 
+ 
+@@ -577,7 +582,7 @@
+ }
+ 
+ 
+-void
++int
+ addpwent (struct database_dyn *db, int fd, request_header *req,
+ 	  void *key, uid_t c_uid)
+ {
+@@ -590,12 +595,12 @@
+         dbg_log (_("Invalid numeric index \"%s\"!"), (char *) key);
+ 
+       errno = EINVAL;
+-      return;
++      return -errno;
+     }
+ 
+   union keytype u = { .i = idx };
+ 
+-  addpwbyX (db, fd, req, u, key, c_uid, NULL, NULL);
++  return addpwbyX (db, fd, req, u, key, c_uid, NULL, NULL);
+ }
+ 
+ 

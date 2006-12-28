@@ -1,0 +1,70 @@
+#! /bin/sh -e
+
+# All lines beginning with `# DP:' are a description of the patch.
+# DP: Description: Fix glibc nscd client code to not fail intermittently
+# DP: Related bugs: 387553
+# DP: Patch author: Mike Mammarella <mdm@google.com>
+# DP: Upstream status: Pending
+# DP: Date: Sep 14 2006
+
+
+if [ $# -ne 2 ]; then
+    echo >&2 "`basename $0`: script expects -patch|-unpatch as argument"
+    exit 1
+fi
+case "$1" in
+    -patch) patch -d "$2" -f --no-backup-if-mismatch -p0 < $0;;
+    -unpatch) patch -d "$2" -f --no-backup-if-mismatch -R -p0 < $0;;
+    *)
+	echo >&2 "`basename $0`: script expects -patch|-unpatch as argument"
+	exit 1
+esac
+exit 0
+
+--- nscd/nscd_helper.c	2006-02-28 21:39:03.000000000 -0800
++++ nscd/nscd_helper.c	2006-09-14 16:29:45.812773000 -0700
+@@ -43,6 +43,14 @@
+   do
+     {
+       ret = TEMP_FAILURE_RETRY (__read (fd, buf, n));
++      if (ret < 0 && errno == EAGAIN)
++	{
++	  struct pollfd fds[1];
++	  fds[0].fd = fd;
++	  fds[0].events = POLLIN | POLLERR | POLLHUP;
++	  if (__poll (fds, 1, 200) > 0)
++	    continue;
++	}
+       if (ret <= 0)
+ 	break;
+       buf = (char *) buf + ret;
+@@ -57,8 +65,10 @@
+ __readvall (int fd, const struct iovec *iov, int iovcnt)
+ {
+   ssize_t ret = TEMP_FAILURE_RETRY (__readv (fd, iov, iovcnt));
+-  if (ret <= 0)
++  if (ret <= 0 && errno != EAGAIN)
+     return ret;
++  if (ret < 0)
++    ret = 0;
+ 
+   size_t total = 0;
+   for (int i = 0; i < iovcnt; ++i)
+@@ -81,6 +91,17 @@
+ 	  iovp->iov_base = (char *) iovp->iov_base + r;
+ 	  iovp->iov_len -= r;
+ 	  r = TEMP_FAILURE_RETRY (__readv (fd, iovp, iovcnt));
++	  if (r < 0 && errno == EAGAIN)
++	    {
++	      struct pollfd fds[1];
++	      fds[0].fd = fd;
++	      fds[0].events = POLLIN | POLLERR | POLLHUP;
++	      if (__poll (fds, 1, 200) > 0)
++		{
++		  r = 0;
++		  continue;
++		}
++	    }
+ 	  if (r <= 0)
+ 	    break;
+ 	  ret += r;
