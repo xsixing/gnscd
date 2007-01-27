@@ -1,0 +1,54 @@
+.\"                                      Hey, EMACS: -*- nroff -*-
+.\" First parameter, NAME, should be all caps
+.\" Second parameter, SECTION, should be 1-8, maybe w/ subsection
+.\" other parameters are allowed: see man(7), man(1)
+.TH GNSCD 8 "January 26, 2007"
+.\" Please adjust this date whenever revising the manpage.
+.\"
+.\" Some roff macros, for reference:
+.\" .nh        disable hyphenation
+.\" .hy        enable hyphenation
+.\" .ad l      left justify
+.\" .ad b      justify to both left and right margins
+.\" .nf        disable filling
+.\" .fi        enable filling
+.\" .br        insert line break
+.\" .sp <n>    insert n+1 empty lines
+.\" for manpage-specific macros, see man(7)
+.SH NAME
+gnscd \- name service caching daemon
+.SH SYNOPSIS
+.B gnscd
+.RI [ options ]
+.SH DESCRIPTION
+.B gnscd
+is a replacement for nscd that has been rewritten with different
+networking and database code. It implements both the glibc235 and
+glibc232 nscd protocols in one daemon, sharing one cache.
+.PP
+.\" TeX users may be more comfortable with the \fB<whatever>\fP and
+.\" \fI<whatever>\fP escape sequences to invode bold face and italics, 
+.\" respectively.
+.SH OPTIONS
+.TP
+.B \-g
+Display basic information on daemon status.  For compatibility with GNU nscd.
+Useful in watchdog scripts.
+.TP
+.B \-d
+Don't daemonize.  Also print debugging
+information about what is going on inside gnscd
+.SH FILES
+.B /var/run/nscd/socket
+- glibc235 protocol socket
+.br
+.B /var/run/.nscd_socket
+- glibc232 protocol socket
+.PP
+.SH SEE ALSO
+.BR nscd (8).
+.SH AUTHOR
+.B gnscd
+was written by Mike Mammarella.
+.PP
+This manual page was written by Drake Diedrich <dld@google.com>.
